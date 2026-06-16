@@ -30,7 +30,9 @@ sudo python3 tun_rns_linux_host.py --ip 10.244.0.1 --peer 10.244.0.2 --mss-clamp
   listen_on = 0.0.0.0
 
 3)Run as admin client EXE for Windows(to run on windows download wintun.dll for you arch and replace to script. https://www.wintun.net/)
+
 OR
+
 4)run client script:
 Linux client GUI: python3 tun_rns_linux_gui.py
 Windows: python tun_rns_win.py

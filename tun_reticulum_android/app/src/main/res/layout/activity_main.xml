@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp"
+    android:background="#1e1e1e">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="My Hash:"
+        android:textColor="#4fc3f7"
+        android:textSize="14sp" />
+    <TextView
+        android:id="@+id/tv_my_hash"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="(initializing...)"
+        android:textColor="#e0e0e0"
+        android:textSize="12sp"
+        android:fontFamily="monospace"
+        android:paddingBottom="16dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Server Host:"
+        android:textColor="#e0e0e0"
+        android:textSize="14sp" />
+    <EditText
+        android:id="@+id/et_server_host"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="192.168.1.100"
+        android:inputType="text"
+        android:background="#3c3c3c"
+        android:textColor="#e0e0e0"
+        android:padding="8dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Server Port:"
+        android:textColor="#e0e0e0"
+        android:textSize="14sp"
+        android:paddingTop="8dp" />
+    <EditText
+        android:id="@+id/et_server_port"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="4242"
+        android:inputType="number"
+        android:background="#3c3c3c"
+        android:textColor="#e0e0e0"
+        android:padding="8dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Destination Hash:"
+        android:textColor="#e0e0e0"
+        android:textSize="14sp"
+        android:paddingTop="8dp" />
+    <EditText
+        android:id="@+id/et_dest_hash"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="a1b2c3d4..."
+        android:inputType="text"
+        android:background="#3c3c3c"
+        android:textColor="#e0e0e0"
+        android:padding="8dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Client IP:"
+        android:textColor="#e0e0e0"
+        android:textSize="14sp"
+        android:paddingTop="8dp" />
+    <EditText
+        android:id="@+id/et_client_ip"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="10.244.0.2"
+        android:inputType="text"
+        android:background="#3c3c3c"
+        android:textColor="#e0e0e0"
+        android:padding="8dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="TUN MTU:"
+        android:textColor="#e0e0e0"
+        android:textSize="14sp"
+        android:paddingTop="8dp" />
+    <EditText
+        android:id="@+id/et_tun_mtu"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="1500"
+        android:inputType="number"
+        android:background="#3c3c3c"
+        android:textColor="#e0e0e0"
+        android:padding="8dp" />
+
+    <CheckBox
+        android:id="@+id/cb_verbose"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Verbose packet log"
+        android:textColor="#e0e0e0"
+        android:textSize="13sp"
+        android:paddingTop="8dp" />
+
+    <CheckBox
+        android:id="@+id/cb_compress"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Enable compression"
+        android:textColor="#e0e0e0"
+        android:textSize="13sp"
+        android:paddingTop="4dp" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:paddingTop="8dp">
+        <Button
+            android:id="@+id/btn_connect"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Connect"
+            android:backgroundTint="#007acc" />
+        <Button
+            android:id="@+id/btn_disconnect"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Disconnect"
+            android:backgroundTint="#555555" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Status:"
+        android:textColor="#4fc3f7"
+        android:textSize="14sp"
+        android:paddingTop="12dp" />
+    <TextView
+        android:id="@+id/tv_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="idle"
+        android:textColor="#e0e0e0"
+        android:textSize="14sp"
+        android:paddingBottom="8dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Log:"
+        android:textColor="#4fc3f7"
+        android:textSize="14sp" />
+    <ScrollView
+        android:id="@+id/sv_log"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="#101010">
+        <TextView
+            android:id="@+id/tv_log"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textColor="#e0e0e0"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:padding="4dp" />
+    </ScrollView>
+
+</LinearLayout>

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 
 import RNS
@@ -35,6 +36,25 @@ DEFAULT_LOGFILE = "/var/log/rns-tunnel.log"
 # ============================================================================
 # Helpers
 # ============================================================================
+COMPRESS_MARKER = b'\x01'
+RAW_MARKER      = b'\x00'
+
+def compress_packet(data):
+    c = zlib.compress(data, 1)
+    return (COMPRESS_MARKER + c) if len(c) < len(data) else (RAW_MARKER + data)
+
+def decompress_packet(data):
+    if not data:
+        return data
+    if data[0] == 0x01:
+        try:
+            return zlib.decompress(data[1:])
+        except Exception:
+            return data
+    elif data[0] == 0x00:
+        return data[1:]
+    return data
+
 def _run(cmd, dry_run=False, check=False):
     if dry_run:
         print(f"[dry-run] {cmd}")
@@ -235,13 +255,15 @@ class TUNDevice:
 # Endpoint
 # ============================================================================
 class TunnelEndpoint:
-    def __init__(self, tun, identity_path, log=print):
+    def __init__(self, tun, identity_path, use_compression=False, log=print):
         self.tun          = tun
         self.identity_path = identity_path
+        self.use_compression = use_compression
         self.log          = log
         self.identity     = None
         self.destination  = None
         self.links        = []
+        self.ip_to_link   = {}
         self._lock        = threading.Lock()
         self._stop_evt    = threading.Event()
         self._ready       = threading.Event()
@@ -288,6 +310,11 @@ class TunnelEndpoint:
         self.destination.set_proof_strategy(RNS.Destination.PROVE_ALL)
         self.destination.set_packet_callback(self._on_direct_packet)
         self.destination.set_link_established_callback(self._on_link)
+        self.destination.register_request_handler(
+            "/ip_assign",
+            response_generator=self._handle_ip_request,
+            allow=RNS.Destination.ALLOW_ALL
+        )
         self.destination.announce()
         self.log(f"[RNS] endpoint hash: {RNS.prettyhexrep(self.destination.hash)}", "info")
         self._ready.set()
@@ -296,36 +323,88 @@ class TunnelEndpoint:
         with self._lock:
             self.links.append(link)
         link.set_link_closed_callback(self._on_link_closed)
-        link.set_resource_callback(self._on_resource_advertised)
-        link.set_packet_callback(self._on_direct_packet)
+        link.set_resource_callback(lambda res: self._on_resource_advertised(res, link))
+        link.set_packet_callback(lambda msg, pkt: self._on_direct_packet(msg, pkt, link))
         self.log(
             f"[RNS] link established with "
-            f"{RNS.prettyhexrep(link.destination.hash) if link.destination else '?'}",
-            "ok",
+            f"{RNS.prettyhexrep(link.destination.hash) if link.destination else '?'},"
+            f" total active links={len(self.links)}"
         )
 
     def _on_link_closed(self, link):
         with self._lock:
             if link in self.links:
                 self.links.remove(link)
+            dead_ips = [ip for ip, lid in self.ip_to_link.items() if lid == link.link_id]
+            for ip in dead_ips:
+                del self.ip_to_link[ip]
         self.log("[RNS] link closed", "warn")
 
-    def _on_resource_advertised(self, resource):
-        resource.set_callback(self._on_resource_complete)
+    def _on_resource_advertised(self, resource, link):
+        resource.set_callback(lambda res: self._on_resource_complete(res, link))
         return True
 
-    def _on_resource_complete(self, resource):
+    def _on_resource_complete(self, resource, link):
         try:
             data = bytes(resource.data)
         except Exception as e:
             self.log(f"Bad resource: {e}", "err")
             return
+        decompressed = decompress_packet(data)
+        self._learn_ip(decompressed, link)
         if self.tun is not None:
-            self.tun.write(data)
+            self.tun.write(decompressed)
 
-    def _on_direct_packet(self, data, packet):
+    def _on_direct_packet(self, data, packet, link):
+        decompressed = decompress_packet(data)
+        self._learn_ip(decompressed, link)
         if self.tun is not None:
-            self.tun.write(data)
+            self.tun.write(decompressed)
+
+    def _learn_ip(self, data, link):
+        if len(data) < 20:
+            return
+        version = (data[0] >> 4) & 0xF
+        if version == 4:
+            src_ip = f"{data[12]}.{data[13]}.{data[14]}.{data[15]}"
+            with self._lock:
+                if self.ip_to_link.get(src_ip) != link.link_id:
+                    self.ip_to_link[src_ip] = link.link_id
+                    self.log(f"[ROUTING] learned client IP {src_ip} on link {RNS.prettyhexrep(link.destination.hash) if link.destination else '?'}", "ok")
+
+    def _handle_ip_request(self, path, data, request_id, link_id, remote_identity, requested_at):
+        with self._lock:
+            # Clean up dead links from mapping
+            assigned_link_ids = {l.link_id for l in self.links if l.status == RNS.Link.ACTIVE}
+            for ip in list(self.ip_to_link.keys()):
+                if self.ip_to_link[ip] not in assigned_link_ids:
+                    del self.ip_to_link[ip]
+            
+            # Find target link in active links
+            target_link = None
+            for l in self.links:
+                if l.link_id == link_id:
+                    target_link = l
+                    break
+            
+            if not target_link:
+                self.log(f"[ROUTING] IP request failed: link_id {RNS.prettyhexrep(link_id)} not found", "err")
+                return None
+
+            # Find first free IP from 10.244.0.2 to 10.244.0.254
+            assigned_ips = set(self.ip_to_link.keys())
+            ip_last = 2
+            while ip_last <= 254:
+                candidate_ip = f"10.244.0.{ip_last}"
+                if candidate_ip not in assigned_ips:
+                    break
+                ip_last += 1
+            else:
+                candidate_ip = "10.244.0.2" # fallback if full
+                
+            self.ip_to_link[candidate_ip] = link_id
+            self.log(f"[ROUTING] Assigned IP {candidate_ip} to link {RNS.prettyhexrep(target_link.destination.hash) if target_link.destination else '?'}", "ok")
+            return candidate_ip.encode("utf-8")
 
     def _on_tun_packet(self, data):
         if self.identity is None or not self.links:
@@ -333,16 +412,46 @@ class TunnelEndpoint:
         if len(data) < 20:
             return
         version = (data[0] >> 4) & 0xF
+        dst_ip = None
         if version == 4:
             dst = data[16:20]
             if dst[0] >= 224 or dst == b'\xff\xff\xff\xff':
                 return
+            dst_ip = f"{dst[0]}.{dst[1]}.{dst[2]}.{dst[3]}"
         elif version == 6:
             if data[24] == 0xff:
                 return
-        self.send_to_links(data)
+
+        target_link = None
+        if dst_ip:
+            with self._lock:
+                target_link_id = self.ip_to_link.get(dst_ip)
+                if target_link_id:
+                    for l in self.links:
+                        if l.link_id == target_link_id and l.status == RNS.Link.ACTIVE:
+                            target_link = l
+                            break
+                    else:
+                        if dst_ip in self.ip_to_link:
+                            del self.ip_to_link[dst_ip]
+
+        if target_link:
+            self.send_to_link(data, target_link)
+        else:
+            self.send_to_links(data)
+
+    def send_to_link(self, data, link):
+        if self.use_compression:
+            data = compress_packet(data)
+        try:
+            pkt = RNS.Packet(link, data)
+            pkt.send()
+        except Exception as e:
+            self.log(f"Link send failed: {e}", "err")
 
     def send_to_links(self, data):
+        if self.use_compression:
+            data = compress_packet(data)
         with self._lock:
             links = [l for l in self.links if l.status == RNS.Link.ACTIVE]
         for link in links:
@@ -446,6 +555,7 @@ def _make_argparser():
     p.add_argument("--peer",       default="10.244.0.2",      help="IP dest (route with TUN)")
     p.add_argument("--netmask",    default="255.255.255.0", help="netmask")
     p.add_argument("--mtu",        type=int, default=1500,  help="MTU TUN-interface")
+    p.add_argument("--compress",   action="store_true",    help="enable zlib compression")
     p.add_argument("--config-dir", default=None,           help="config dir Reticulum")
     p.add_argument("--no-stats",   action="store_true",    help="no stats")
     p.add_argument("--mss-clamp",  action="store_true",    help="iptables TCPMSS on tun0 (PMTUD for traffic through the tunnel)")
@@ -522,6 +632,7 @@ def main():
     endpoint = TunnelEndpoint(
         tun if not args.dry_run else None,
         identity_path,
+        use_compression=args.compress,
         log=log,
     )
     if not args.dry_run and not endpoint.identity:

@@ -39,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 
 import RNS
@@ -59,6 +60,25 @@ DEFAULT_LOGFILE = "/var/log/rns-client.log"
 # ============================================================================
 # Helpers
 # ============================================================================
+COMPRESS_MARKER = b'\x01'
+RAW_MARKER      = b'\x00'
+
+def compress_packet(data):
+    c = zlib.compress(data, 1)
+    return (COMPRESS_MARKER + c) if len(c) < len(data) else (RAW_MARKER + data)
+
+def decompress_packet(data):
+    if not data:
+        return data
+    if data[0] == 0x01:
+        try:
+            return zlib.decompress(data[1:])
+        except Exception:
+            return data
+    elif data[0] == 0x00:
+        return data[1:]
+    return data
+
 def _netmask_to_cidr(mask):
     return sum(bin(int(x)).count("1") for x in mask.split("."))
 
@@ -181,7 +201,7 @@ class TUNDevice:
     def _reader(self):
         while not self._stop_evt.is_set():
             try:
-                r, _, _ = select.select([self._fd], [], [], 0.5)
+                r, _, _ = select.select([self._fd], [], [], 0.05)
                 if not r:
                     continue
                 data = os.read(self._fd, self.mtu + 32)
@@ -317,9 +337,10 @@ def get_physical_interface():
 # Client
 # ============================================================================
 class TunnelClient:
-    def __init__(self, tun, config_dir, log):
+    def __init__(self, tun, config_dir, use_compression, log):
         self.tun        = tun
         self.config_dir = config_dir
+        self.use_compression = use_compression
         self.log        = log
         self.identity   = None
         self.destination= None
@@ -462,7 +483,7 @@ class TunnelClient:
     def _on_link_packet(self, message, packet):
         self.rx_bytes += len(message)
         self.rx_packets += 1
-        self._tun_write(message)
+        self._tun_write(decompress_packet(message))
 
     def _on_resource_advertised(self, resource):
         resource.set_callback(self._on_resource_complete)
@@ -475,10 +496,47 @@ class TunnelClient:
             return
         self.rx_bytes += len(data)
         self.rx_packets += 1
-        self._tun_write(data)
+        self._tun_write(decompress_packet(data))
+
+    def request_ip(self):
+        with self._link_lock:
+            link = self.link
+        if not link or link.status != RNS.Link.ACTIVE:
+            return None
+            
+        evt = threading.Event()
+        assigned_ip = None
+        
+        def _response_cb(receipt):
+            nonlocal assigned_ip
+            try:
+                res_data = receipt.response
+                if res_data:
+                    assigned_ip = res_data.decode("utf-8").strip()
+            except Exception as e:
+                self.log(f"Error parsing IP assignment response: {e}", "err")
+            evt.set()
+            
+        def _failed_cb(receipt):
+            evt.set()
+            
+        try:
+            link.request(
+                "/ip_assign",
+                b"",
+                response_callback=_response_cb,
+                failed_callback=_failed_cb,
+                timeout=10
+            )
+        except Exception as e:
+            self.log(f"Failed to send IP request: {e}", "err")
+            return None
+            
+        evt.wait(timeout=10)
+        return assigned_ip
 
     def _on_direct_packet(self, data, packet):
-        self._tun_write(data)
+        self._tun_write(decompress_packet(data))
 
     def _tun_to_link(self, data):
         if len(data) < 20:
@@ -488,12 +546,19 @@ class TunnelClient:
             dst = data[16:20]
             if dst[0] >= 224 or dst == b'\xff\xff\xff\xff':
                 return
+            protocol = data[9]
+            if protocol == 17 and len(data) >= 24:
+                dst_port = int.from_bytes(data[22:24], 'big')
+                if dst_port in (5353, 5355, 137, 138, 1900):
+                    return
         elif version == 6:
             if data[24] == 0xff:
                 return
         link = self.link
         if not link or link.status != RNS.Link.ACTIVE:
             return
+        if self.use_compression:
+            data = compress_packet(data)
         try:
             pkt = RNS.Packet(link, data)
             pkt.send()
@@ -648,10 +713,11 @@ def main():
     ap.add_argument("--dest",       default=os.environ.get("RNS_TUN_DEST"),
                     help="remote TUN endpoint destination hash")
     ap.add_argument("--tun",        default="tun0",       help="TUN interface name")
-    ap.add_argument("--tun-ip",     default="10.244.0.2",  help="local TUN IP")
+    ap.add_argument("--tun-ip",     default="auto",        help="local TUN IP")
     ap.add_argument("--tun-peer",   default="10.244.0.1",  help="remote TUN peer IP")
     ap.add_argument("--netmask",    default="255.255.255.0", help="TUN netmask")
     ap.add_argument("--mtu",        type=int, default=1500, help="TUN MTU")
+    ap.add_argument("--compress",   action="store_true",    help="enable zlib compression")
     ap.add_argument("--config-dir", default=None,          help="Reticulum config path")
     ap.add_argument("--timeout",    type=int, default=30,   help="connection timeout (seconds)")
     ap.add_argument("--no-stats",   action="store_true",   help="disable statistics output")
@@ -706,26 +772,36 @@ def main():
 
     log(f"config: {config_dir}")
     log(f"dest: {args.dest}")
-    log(f"TUN: {args.tun} ip={args.tun_ip} peer={args.tun_peer} mtu={args.mtu}")
+    log(f"TUN: {args.tun} ip={args.tun_ip} peer={args.tun_peer} mtu={args.mtu} compress={args.compress}")
 
     tun = TUNDevice(
         args.tun, args.tun_ip, args.tun_peer, args.netmask, args.mtu, log=log,
     )
-    tun.open()
 
-    routes = RouteManager(cfg_path, args.tun, args.tun_peer, log)
-
-    client = TunnelClient(tun, config_dir, log)
+    client = TunnelClient(tun, config_dir, args.compress, log)
     if not client.destination:
-        tun.close()
         return 1
 
     ok = client.connect(args.dest, timeout=args.timeout)
     if not ok:
-        routes.teardown()
-        tun.close()
         return 1
 
+    if tun.local_ip == "auto":
+        log("[RNS] requesting IP address from host...", "info")
+        assigned_ip = client.request_ip()
+        if assigned_ip:
+            log(f"[RNS] host assigned IP: {assigned_ip}", "ok")
+            tun.local_ip = assigned_ip
+        else:
+            val = client.destination.hash[-1]
+            ip_last = 2 + (val % 253)
+            fallback_ip = f"10.244.0.{ip_last}"
+            log(f"[RNS] failed to get IP from host, using fallback: {fallback_ip}", "warn")
+            tun.local_ip = fallback_ip
+
+    tun.open()
+
+    routes = RouteManager(cfg_path, args.tun, args.tun_peer, log)
     routes.setup()
 
     client._thread = threading.Thread(

@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 import traceback
+import zlib
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, messagebox, scrolledtext
@@ -97,6 +98,24 @@ def default_config_dir(portable=False):
     appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
     return str(Path(appdata) / "Reticulum")
 
+COMPRESS_MARKER = b'\x01'
+RAW_MARKER      = b'\x00'
+
+def compress_packet(data):
+    c = zlib.compress(data, 1)
+    return (COMPRESS_MARKER + c) if len(c) < len(data) else (RAW_MARKER + data)
+
+def decompress_packet(data):
+    if not data:
+        return data
+    if data[0] == 0x01:
+        try:
+            return zlib.decompress(data[1:])
+        except Exception:
+            return data
+    elif data[0] == 0x00:
+        return data[1:]
+    return data
 
 def ensure_default_config(config_dir):
     """
@@ -431,9 +450,10 @@ class ReticulumNode:
     Reticulum node with TUN <-> RNS.Resource bridge (via active link).
     """
 
-    def __init__(self, log_fn, config_dir=None):
+    def __init__(self, log_fn, config_dir=None, use_compression=False):
         self.log_fn     = log_fn
         self.config_dir = config_dir
+        self.use_compression = use_compression
         self._ready     = threading.Event()
         self._stop_evt  = threading.Event()
         self.identity   = None
@@ -630,7 +650,7 @@ class ReticulumNode:
     def _on_link_packet(self, message, packet):
         self.rx_bytes   += len(message)
         self.rx_packets += 1
-        self._tun_write(message)
+        self._tun_write(decompress_packet(message))
 
     def _on_resource_advertised(self, resource):
         resource.set_callback(self._on_resource_complete)
@@ -644,10 +664,47 @@ class ReticulumNode:
             return
         self.rx_bytes   += len(data)
         self.rx_packets += 1
-        self._tun_write(data)
+        self._tun_write(decompress_packet(data))
+
+    def request_ip(self):
+        with self._link_lock:
+            link = self.link
+        if not link or link.status != RNS.Link.ACTIVE:
+            return None
+            
+        evt = threading.Event()
+        assigned_ip = None
+        
+        def _response_cb(receipt):
+            nonlocal assigned_ip
+            try:
+                res_data = receipt.response
+                if res_data:
+                    assigned_ip = res_data.decode("utf-8").strip()
+            except Exception as e:
+                self.log_fn(f"[RNS] error parsing IP assignment: {e}", "err")
+            evt.set()
+            
+        def _failed_cb(receipt):
+            evt.set()
+            
+        try:
+            link.request(
+                "/ip_assign",
+                b"",
+                response_callback=_response_cb,
+                failed_callback=_failed_cb,
+                timeout=10
+            )
+        except Exception as e:
+            self.log_fn(f"[RNS] failed to send IP request: {e}", "err")
+            return None
+            
+        evt.wait(timeout=10)
+        return assigned_ip
 
     def _on_direct_packet(self, data, packet):
-        self._tun_write(data)
+        self._tun_write(decompress_packet(data))
 
     def _tun_to_link(self, data):
         if len(data) < 20:
@@ -657,12 +714,19 @@ class ReticulumNode:
             dst = data[16:20]
             if dst[0] >= 224 or dst == b'\xff\xff\xff\xff':
                 return
+            protocol = data[9]
+            if protocol == 17 and len(data) >= 24:
+                dst_port = int.from_bytes(data[22:24], 'big')
+                if dst_port in (5353, 5355, 137, 138, 1900):
+                    return
         elif version == 6:
             if data[24] == 0xff:
                 return
         link = self.link
         if not link or link.status != RNS.Link.ACTIVE:
             return
+        if self.use_compression:
+            data = compress_packet(data)
         try:
             pkt = RNS.Packet(link, data)
             pkt.send()
@@ -1137,6 +1201,7 @@ class App(tk.Tk):
         self.node = ReticulumNode(
             log_fn=self._qlog,
             config_dir=str(cfg_dir),
+            use_compression=getattr(self.args, "compress", False),
         )
         self.node.on_link_state = self._on_link_state
 
@@ -1218,6 +1283,10 @@ class App(tk.Tk):
         self.btn_disconnect = ttk.Button(box_conn, text="Disconnect", command=self._do_disconnect, state=tk.DISABLED)
         self.btn_disconnect.pack(side=tk.LEFT, padx=6, pady=(0, 6))
         ttk.Button(box_conn, text="Re-announce", command=self._do_announce).pack(side=tk.LEFT, padx=6, pady=(0, 6))
+        
+        self.var_compress = tk.BooleanVar(value=getattr(self.args, "compress", False))
+        ttk.Checkbutton(box_conn, text="Compress", variable=self.var_compress, command=self._on_compress_changed).pack(side=tk.LEFT, padx=6, pady=(0, 6))
+        
         self.lbl_state = ttk.Label(box_conn, text="● no link", foreground=self.WARN, style="Panel.TLabel")
         self.lbl_state.pack(side=tk.RIGHT, padx=8)
 
@@ -1229,7 +1298,7 @@ class App(tk.Tk):
         self.ent_tun_name = ttk.Entry(frm, width=14); self.ent_tun_name.insert(0, "tun0")
         self.ent_tun_name.grid(row=0, column=1, padx=4, pady=2, sticky=tk.W)
         ttk.Label(frm, text="Local IP:").grid(row=0, column=2, sticky=tk.W, padx=(10, 0))
-        self.ent_tun_ip = ttk.Entry(frm, width=14); self.ent_tun_ip.insert(0, "10.244.0.2")
+        self.ent_tun_ip = ttk.Entry(frm, width=14); self.ent_tun_ip.insert(0, "auto")
         self.ent_tun_ip.grid(row=0, column=3, padx=4, pady=2, sticky=tk.W)
         ttk.Label(frm, text="Peer IP:").grid(row=0, column=4, sticky=tk.W, padx=(10, 0))
         self.ent_tun_peer = ttk.Entry(frm, width=14); self.ent_tun_peer.insert(0, "10.244.0.1")
@@ -1415,6 +1484,10 @@ class App(tk.Tk):
     def _do_announce(self):
         self.node.re_announce()
 
+    def _on_compress_changed(self):
+        if hasattr(self, "node") and self.node:
+            self.node.use_compression = self.var_compress.get()
+
     def _do_tun_on(self):
         if not self._is_admin():
             messagebox.showwarning(
@@ -1423,10 +1496,26 @@ class App(tk.Tk):
                 "Run the program as administrator."
             )
             return
+        local_ip = self.ent_tun_ip.get().strip() or "auto"
+        if local_ip == "auto":
+            self._qlog("[RNS] requesting IP address from host...", "info")
+            assigned_ip = self.node.request_ip()
+            if assigned_ip:
+                self._qlog(f"[RNS] host assigned IP: {assigned_ip}", "ok")
+                local_ip = assigned_ip
+            else:
+                if self.node.destination:
+                    val = self.node.destination.hash[-1]
+                    ip_last = 2 + (val % 253)
+                    fallback_ip = f"10.244.0.{ip_last}"
+                else:
+                    fallback_ip = "10.244.0.2"
+                self._qlog(f"[RNS] failed to get IP from host, using fallback: {fallback_ip}", "warn")
+                local_ip = fallback_ip
         try:
             tun = WinTunInterface(
                 name    = self.ent_tun_name.get().strip() or "tun0",
-                local_ip= self.ent_tun_ip.get().strip() or "10.244.0.2",
+                local_ip= local_ip,
                 peer_ip = self.ent_tun_peer.get().strip() or "10.244.0.1",
                 netmask = self.ent_tun_mask.get().strip() or "255.255.255.0",
                 mtu     = int(self.ent_tun_mtu.get().strip() or "1500"),
@@ -1838,14 +1927,34 @@ def _run_cli(args):
     log(f"Config: {config_dir}")
     log(f"Dest: {args.dest}")
 
-    node = ReticulumNode(log_fn=log, config_dir=config_dir)
+    node = ReticulumNode(log_fn=log, config_dir=config_dir, use_compression=args.compress)
 
     log(f"Identity: {RNS.prettyhexrep(node.identity.hash)}")
 
-    log(f"TUN: name={args.tun_name} ip={args.tun_ip} peer={args.tun_peer} mask={args.tun_mask} mtu={args.tun_mtu}")
+    log(f"Connecting to {args.dest} ...")
+    ok = node.connect_to(args.dest, timeout=30)
+    if not ok:
+        log("Connect failed", "err")
+        return 1
+
+    local_ip = args.tun_ip
+    if local_ip == "auto":
+        log("[RNS] requesting IP address from host...", "info")
+        assigned_ip = node.request_ip()
+        if assigned_ip:
+            log(f"[RNS] host assigned IP: {assigned_ip}", "ok")
+            local_ip = assigned_ip
+        else:
+            val = node.destination.hash[-1]
+            ip_last = 2 + (val % 253)
+            fallback_ip = f"10.244.0.{ip_last}"
+            log(f"[RNS] failed to get IP from host, using fallback: {fallback_ip}", "warn")
+            local_ip = fallback_ip
+
+    log(f"TUN: name={args.tun_name} ip={local_ip} peer={args.tun_peer} mask={args.tun_mask} mtu={args.tun_mtu}")
 
     tun = WinTunInterface(
-        name=args.tun_name, local_ip=args.tun_ip, peer_ip=args.tun_peer,
+        name=args.tun_name, local_ip=local_ip, peer_ip=args.tun_peer,
         netmask=args.tun_mask, mtu=args.tun_mtu, log=log,
     )
     try:
@@ -1855,13 +1964,6 @@ def _run_cli(args):
         return 1
 
     node.set_tun(tun)
-
-    log(f"Connecting to {args.dest} ...")
-    ok = node.connect_to(args.dest, timeout=30)
-    if not ok:
-        log("Connect failed", "err")
-        tun.close()
-        return 1
 
     log("Connected! TUN + link active.", "ok")
 
@@ -1980,7 +2082,7 @@ def main():
                     help="CLI mode: no GUI, connects to --dest, starts TUN")
     ap.add_argument("--tun-name",   default="tun0",
                     help="TUN adapter name (default: tun0)")
-    ap.add_argument("--tun-ip",     default="10.244.0.2",
+    ap.add_argument("--tun-ip",     default="auto",
                     help="TUN adapter IP (default: 10.244.0.2)")
     ap.add_argument("--tun-peer",   default="10.244.0.1",
                     help="peer IP (default: 10.244.0.1)")
@@ -1990,6 +2092,8 @@ def main():
                     help="TUN MTU (default: 1500)")
     ap.add_argument("--daemon",     action="store_true",
                     help="(Windows) restart in background (DETACHED_PROCESS)")
+    ap.add_argument("--compress",   action="store_true",
+                    help="enable zlib compression")
     ap.add_argument("--mss-clamp",  action="store_true",
                     help="(Linux only) iptables TCPMSS; ignored on Windows")
     ap.add_argument("--__child",    action="store_true",

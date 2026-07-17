@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 import traceback
+import zlib
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, messagebox, scrolledtext
@@ -89,6 +90,24 @@ def ensure_default_config(config_dir):
 def _netmask_to_cidr(mask):
     return sum(bin(int(x)).count("1") for x in mask.split("."))
 
+COMPRESS_MARKER = b'\x01'
+RAW_MARKER      = b'\x00'
+
+def compress_packet(data):
+    c = zlib.compress(data, 1)
+    return (COMPRESS_MARKER + c) if len(c) < len(data) else (RAW_MARKER + data)
+
+def decompress_packet(data):
+    if not data:
+        return data
+    if data[0] == 0x01:
+        try:
+            return zlib.decompress(data[1:])
+        except Exception:
+            return data
+    elif data[0] == 0x00:
+        return data[1:]
+    return data
 
 class LinuxTunInterface:
     def __init__(self, name="tun0", local_ip="10.244.0.2", peer_ip="10.244.0.1",
@@ -152,7 +171,7 @@ class LinuxTunInterface:
     def _reader(self):
         while not self._stop_evt.is_set():
             try:
-                r, _, _ = select.select([self._fd], [], [], 0.5)
+                r, _, _ = select.select([self._fd], [], [], 0.05)
                 if not r:
                     continue
                 data = os.read(self._fd, self.mtu + 32)
@@ -200,9 +219,10 @@ class LinuxTunInterface:
 # Reticulum node
 # ============================================================================
 class ReticulumNode:
-    def __init__(self, log_fn, config_dir=None):
+    def __init__(self, log_fn, config_dir=None, use_compression=False):
         self.log_fn     = log_fn
         self.config_dir = config_dir
+        self.use_compression = use_compression
         self._ready     = threading.Event()
         self._stop_evt  = threading.Event()
         self.identity   = None
@@ -362,7 +382,7 @@ class ReticulumNode:
     def _on_link_packet(self, message, packet):
         self.rx_bytes   += len(message)
         self.rx_packets += 1
-        self._tun_write(message)
+        self._tun_write(decompress_packet(message))
 
     def _on_resource_advertised(self, resource):
         resource.set_callback(self._on_resource_complete)
@@ -376,10 +396,10 @@ class ReticulumNode:
             return
         self.rx_bytes   += len(data)
         self.rx_packets += 1
-        self._tun_write(data)
+        self._tun_write(decompress_packet(data))
 
     def _on_direct_packet(self, data, packet):
-        self._tun_write(data)
+        self._tun_write(decompress_packet(data))
 
     def _tun_to_link(self, data):
         if len(data) < 20:
@@ -389,12 +409,19 @@ class ReticulumNode:
             dst = data[16:20]
             if dst[0] >= 224 or dst == b'\xff\xff\xff\xff':
                 return
+            protocol = data[9]
+            if protocol == 17 and len(data) >= 24:
+                dst_port = int.from_bytes(data[22:24], 'big')
+                if dst_port in (5353, 5355, 137, 138, 1900):
+                    return
         elif version == 6:
             if data[24] == 0xff:
                 return
         link = self.link
         if not link or link.status != RNS.Link.ACTIVE:
             return
+        if self.use_compression:
+            data = compress_packet(data)
         try:
             pkt = RNS.Packet(link, data)
             pkt.send()
@@ -819,6 +846,7 @@ class App(tk.Tk):
         self.node = ReticulumNode(
             log_fn=self._qlog,
             config_dir=cfg_dir,
+            use_compression=getattr(self.args, "compress", False),
         )
         self.node.on_link_state = self._on_link_state
 
@@ -894,6 +922,10 @@ class App(tk.Tk):
         self.btn_disconnect = ttk.Button(box_conn, text="Disconnect", command=self._do_disconnect, state=tk.DISABLED)
         self.btn_disconnect.pack(side=tk.LEFT, padx=6, pady=(0, 6))
         ttk.Button(box_conn, text="Re-announce", command=self._do_announce).pack(side=tk.LEFT, padx=6, pady=(0, 6))
+        
+        self.var_compress = tk.BooleanVar(value=getattr(self.args, "compress", False))
+        ttk.Checkbutton(box_conn, text="Compress", variable=self.var_compress, command=self._on_compress_changed).pack(side=tk.LEFT, padx=6, pady=(0, 6))
+        
         self.lbl_state = ttk.Label(box_conn, text="● no link", foreground=self.WARN, style="Panel.TLabel")
         self.lbl_state.pack(side=tk.RIGHT, padx=8)
 
@@ -986,6 +1018,7 @@ class App(tk.Tk):
             self.node = ReticulumNode(
                 log_fn=self._qlog,
                 config_dir=self.args.config_dir,
+                use_compression=getattr(self.args, "compress", False),
             )
             self.node.on_link_state = self._on_link_state
         except Exception as e:
@@ -1085,6 +1118,10 @@ class App(tk.Tk):
 
     def _do_announce(self):
         self.node.re_announce()
+
+    def _on_compress_changed(self):
+        if hasattr(self, "node") and self.node:
+            self.node.use_compression = self.var_compress.get()
 
     def _do_tun_on(self):
         if os.geteuid() != 0:
@@ -1429,6 +1466,8 @@ def main():
                     help="send SIGTERM and exit")
     ap.add_argument("--force-stop", action="store_true",
                     help="force kill process (SIGKILL)")
+    ap.add_argument("--compress",   action="store_true",
+                    help="enable zlib compression")
     ap.add_argument("--tun-name",   default="tun0",
                     help="TUN adapter name (default: tun0)")
     ap.add_argument("--tun-ip",     default="10.244.0.2",

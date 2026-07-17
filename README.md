@@ -53,7 +53,7 @@ Then run the host script manually or check the autostart service:
   ```
 
 2) edit ~/.reticulum/config on host:
-
+  ```
 [[Backbone]]
 
   type = BackboneInterface
@@ -63,19 +63,21 @@ Then run the host script manually or check the autostart service:
   port = 4242
 
   listen_on = 0.0.0.0
+  ```
 
 3)Run as admin client EXE for Windows(to run on windows download wintun.dll for you arch and replace to script. https://www.wintun.net/)
 
 OR
 
 4)run client script:
-
+  ```
 Linux client GUI: python3 tun_rns_linux_gui.py
 
 Windows: python tun_rns_win.py
 
 Windows CLI: python tun_rns_win.py --cli --dest (end-point) --tun-ip 10.244.0.2 --tun-peer 10.244.0.1 --tun-name tun0 --tun-mtu 1500 --tun-mask 24 (RUN AS ADMINISTRATOR!)
-
+  ```
+  
 build.sh not work
 
 update:

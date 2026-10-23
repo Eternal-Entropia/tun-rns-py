@@ -54,7 +54,8 @@ else
   share_instance = Yes
   enable_transport = Yes
   instance_name = tun-host
-
+  
+[interfaces]
 [[Backbone]]
   type = BackboneInterface
   enabled = yes
